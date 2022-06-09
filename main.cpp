@@ -21,9 +21,17 @@
 #include "events/EventQueue.h"
 
 // Application helpers
-#include "DummySensor.h"
 #include "trace_helper.h"
 #include "lora_radio_helper.h"
+#include "Wait.h"
+
+#include "AM2315.h"
+
+AnalogIn   Masse(PA_0); // PA4 dispo comme port
+DigitalIn  User_Button(PB_2);
+double SoustractionMasse = 0.0029304032;
+double ResultatMasse;
+#define SOUSTRACTIONMASSE 0.0029304032
 
 using namespace events;
 
@@ -34,9 +42,9 @@ uint8_t tx_buffer[30];
 uint8_t rx_buffer[30];
 
 /*
- * Sets up an application dependent transmission timer in ms. Used only when Duty Cycling is off for testing
+ * Sets up an application dependent transmission timer in ms. Used only when Duty Cycling is off for testing (temps entre chaque message, de base 3000, 30s = 30000)
  */
-#define TX_TIMER                        10000
+#define TX_TIMER                        8500
 
 /**
  * Maximum number of events for the event queue.
@@ -58,7 +66,7 @@ uint8_t rx_buffer[30];
 /**
  * Dummy sensor class object
  */
-DS1820  ds1820(PC_9);
+//DS1820  ds1820(PC_9);
 
 /**
 * This event queue is the global event queue for both the
@@ -90,8 +98,21 @@ static lorawan_app_callbacks_t callbacks;
 /**
  * Entry point for application
  */
-int main(void)
+
+static void sleeping();
+
+static void sleep_for();
+
+int Start = 0;
+
+AM2315::AM2315(PinName SDA , PinName SCL ):i2c(SDA, SCL)
 {
+}
+ 
+ 
+ 
+int main(void)
+{    
     // setup tracing
     setup_trace();
 
@@ -145,30 +166,96 @@ int main(void)
     return 0;
 }
 
+
+// I2C Temperature and Humidity Sensor AM2315
+//
+bool AM2315::read()
+{
+
+  char data_write[5];
+  char data_read[10];
+  int i =0;
+  for(i=0; i<8; i++)
+    data_read[i]=0;
+
+  // Wake up the sensor
+  // write single byte twice to wake up
+  // single write is not enough
+  data_write[0] = 0x00;
+  i2c.write(AM2315_ADDR,data_write,1,0); 
+  i2c.write(AM2315_ADDR,data_write,1,0);
+  
+  // Read temperature and humidity register
+  // send request to AM2315
+  data_write[0] = AM2315_REG_READ;
+  data_write[1] = 0x00;  // read from adr 0x00
+  data_write[2] = 0x04;  // read 4 bytes
+  i2c.write(AM2315_ADDR, data_write, 3, 0); // with stop
+  
+  // wait 2ms before we start to read reg
+  wait_ns(2); 
+  
+  i2c.read(AM2315_ADDR, data_read, 8, 1);
+
+  if (data_read[0] != AM2315_REG_READ) 
+    return false;
+  // check numbers of bytes read
+  if (data_read[1] != 4) 
+    return false; 
+    
+  humidity = data_read[2];
+  humidity *= 256;
+  humidity += data_read[3];
+  humidity /= 10;
+  
+  celsius = data_read[4] & 0x7F;
+  celsius *= 256;
+  celsius += data_read[5];
+  celsius /= 10;
+
+  if (data_read[4] >> 7) 
+    celsius = -(celsius);
+
+  // return celsius;
+  return true;
+}
+
 /**
  * Sends a message to the Network Server
  */
 static void send_message()
-{
+{  
+    AM2315 hydrotemp;
+    float celsiusMain;
+    float humidityMain;
+    hydrotemp.read();
+    humidityMain = hydrotemp.humidity;
+    celsiusMain = hydrotemp.celsius;
+    
     uint16_t packet_len;
     int16_t retcode;
     int32_t sensor_value;
+    
+    uint32_t PoidsNormalized = 0;
+    uint32_t PoidsLoop = 0;
 
-    if (ds1820.begin()) {
-        ds1820.startConversion();
-        sensor_value = ds1820.read();
-        printf("\r\n Dummy Sensor Value = %d \r\n", sensor_value);
-        ds1820.startConversion();
-    } else {
-        printf("\r\n No sensor found \r\n");
-        return;
-    }
+    // Masse analog entre 0 et 1
+    for(int i = 0;i<1000;i++){
+        wait_us(1000);
+        PoidsLoop = Masse.read_u16(); // Prend la mesure immédiate du poids. (entre 0 et 65535)
+        PoidsNormalized += PoidsLoop; // Prend la mesure immédiate du poids. (entre 0 et 65535)
+        }
+    PoidsNormalized=PoidsNormalized/1000;
 
-    packet_len = sprintf((char *) tx_buffer, "Dummy Sensor Value is %d",
-                         sensor_value);
+    printf("\r\n Sensor Value Celsius = %.10f \r\n", celsiusMain); // TEST printf("\r\n Dummy Sensor Value = %d \r\n", sensor_value);
+    printf("\r\n Sensor Value Humidity = %.10f \r\n", humidityMain);
+    printf("\r\n Sensor Value Weight normalized = 0x%04X \n", PoidsNormalized);
+    printf("\r\n Sensor Value Weight in Kg = %.3f \r\n", (71*(float)PoidsNormalized)/(0.228*65536));
 
-    retcode = lorawan.send(MBED_CONF_LORA_APP_PORT, tx_buffer, packet_len,
-                           MSG_UNCONFIRMED_FLAG);
+    packet_len = sprintf((char *) tx_buffer, "%d|%.2f|%.2f",(int)humidityMain,celsiusMain,(71*(float)PoidsNormalized)/(0.228*65536)); /*  Message envoyé en Base64 à "frm_payload" dans les Forward Uplink Data (ANCIEN CODE : 71*(float)Masse)/0.2388278544) */
+    /*  Humidité en int : Temérature en float 0.X : Masse en 100g float */
+    /* 100|0.1|50.1 */
+    retcode = lorawan.send(MBED_CONF_LORA_APP_PORT, tx_buffer, packet_len,MSG_UNCONFIRMED_FLAG);
 
     if (retcode < 0) {
         retcode == LORAWAN_STATUS_WOULD_BLOCK ? printf("send - WOULD BLOCK\r\n")
@@ -177,12 +264,11 @@ static void send_message()
         if (retcode == LORAWAN_STATUS_WOULD_BLOCK) {
             //retry in 3 seconds
             if (MBED_CONF_LORA_DUTY_CYCLE_ON) {
-                ev_queue.call_in(3000, send_message);
+                ev_queue.call_in(3000, send_message); // (30000 = 30s et 3000 = 3s)
             }
         }
         return;
     }
-
     printf("\r\n %d bytes scheduled for transmission \r\n", retcode);
     memset(tx_buffer, 0, sizeof(tx_buffer));
 }
@@ -221,7 +307,7 @@ static void lora_event_handler(lorawan_event_t event)
             if (MBED_CONF_LORA_DUTY_CYCLE_ON) {
                 send_message();
             } else {
-                ev_queue.call_every(TX_TIMER, send_message);
+                sleeping();
             }
 
             break;
@@ -231,6 +317,9 @@ static void lora_event_handler(lorawan_event_t event)
             break;
         case TX_DONE:
             printf("\r\n Message Sent to Network Server \r\n");
+            
+            sleeping();
+            
             if (MBED_CONF_LORA_DUTY_CYCLE_ON) {
                 send_message();
             }
@@ -265,6 +354,33 @@ static void lora_event_handler(lorawan_event_t event)
         default:
             MBED_ASSERT("Unknown Event");
     }
+}
+
+static void sleeping()
+{
+    if (Start<=1) // METTRE 1 POUR QUE CA MARCHE (envoie 2 message de suite mais marche)
+    {
+        send_message();
+        Start++;
+    }
+    else
+    {
+        printf("\r\n Sleeping for 4 hours \r\n");
+
+        ThisThread::sleep_for(14400000); // Sleep pour 4 heures (30s = 30000) 14400s
+        
+        printf("\r\n Wake up \r\n");
+        send_message();
+        Start=0;
+    }
+}
+
+static void sleep_for()
+{
+    printf("\r\n Sleeping for 4 hours \r\n");
+    ThisThread::sleep_for(14400000); // Sleep pour 4 heures (30s = 30000) 14400s
+        
+    printf("\r\n Wake up \r\n");
 }
 
 // EOF
